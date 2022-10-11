@@ -1,0 +1,811 @@
+#version 460 core
+//#define GL_ARB_shader_precision 1
+#extension GL_ARB_shader_precision: require
+//#define GL_ARB_shader_precision 1
+#define maxsteps 1700
+#define maxdist 200
+#define surfdis 0.01
+#define PI 3.14159265359
+#define econst 2.71828
+#define timestep 0.03
+#define densFactor 2
+#define densMin 0.00
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(rgba32f, binding = 0) uniform image2D imgOutput;
+
+uniform vec2 res;
+uniform float time;
+uniform float fov;
+uniform float rays;
+uniform float timeDT;
+uniform mat4 view;
+uniform sampler2D testSample;
+uniform sampler2D particleAtlas;
+uniform sampler2D galaxy;
+uniform sampler2D noise;
+uniform sampler2D lowResNoise;
+uniform vec3 camog;
+uniform float aP;
+
+float yScale = 0.7;
+
+//light samples
+float lightSamples = 1;
+float lightEnergy = 0;
+vec3 universalRay = vec3(10);
+
+float autoDif(float test);
+float GetDist(vec3 p);
+vec4 GetDistCol(vec3 p, int hit);
+vec3 raymarch(vec3 ro, vec3 rd);
+vec3 getLight(vec3 p, vec3 col);
+vec3 GetNormal(vec3 p);
+vec3 GetNormal(vec3 p);
+float atan2(in float y, in float x);
+float adjustFov(float speed, vec2 wkPos);
+vec3 adjustFov(vec3 camVel, vec3 rd);
+void geodesic(in vec3 rd, in vec3 position, in vec4 bPos, out vec3 newrd);
+void geodesicKerr(in vec3 rd, in vec3 position, in vec4 bPos, out vec3 newrd);
+vec4 adjustLight(vec3 rd, vec3 ro, vec3 spRo);
+vec4 adjustLightKerr(in vec3 rd, in vec3 ro, in vec3 spRo);
+vec3 adjKerrVel(vec3 camVel, vec3 camPos, vec3 ogCamPos);
+vec3 intConversion (vec3 pos);
+vec3 intConversionKerr (vec3 pos);
+float[4][6][6] christoffelSymbols(vec2 rt);
+float lightmarch(vec3 p);
+vec2 densityFunc(vec3 pos, ivec2 ij);
+float redShift(vec3 rayP, vec3 camP);
+
+//converts spherical components into cartesian Position vectors
+void transform(in vec3 sphComp, out vec3 cartPos);
+void transformKerr(in vec3 oblateCoord, out vec3 cartPos);
+float mandelbulbSDF(vec3 p, float power);
+
+float dt;
+vec3 globalLight = vec3(0, 50, 0);
+vec3 cloudCol = vec3(1.0, 0.6824, 0.0);
+
+vec3 compare(vec3 one, vec3 two, vec3 three);
+vec3 rotate(vec3 nd, vec3 camVel);
+//float christoffelKerr[4][6][6];
+vec2 texRes = vec2(4096);
+//time scale
+float tSc = 0.5;
+float radG = 120;
+vec4 bholeA = vec4(0, 0, 0, 1);
+vec4 bholeB = vec4(0, 0, 0, 1.5);
+float timeVel = 1/sqrt(1-1/1.5);
+float GlobalR;
+float GlobalTheta;
+float over = 0;
+float EH;
+vec3 rayOg;
+vec3 camPos;
+vec3 camPosKerr;
+
+void main()
+{
+    //dt = timeDT;
+    ivec2 texCoords = ivec2(gl_GlobalInvocationID.xy);
+    vec3 ogcamPos = texture(testSample, vec2(512 - 0.1f)/vec2(512*3, 512)).xyz;
+    vec3 ogcamVel = texture(testSample, (vec2(512 - 0.1f)+vec2(512, 0))/vec2(512*3, 512)).xyz;
+    
+    float ratio = 0.5*bholeB.w;
+    bholeB.z = 0.999*ratio;
+    EH = (bholeB.w+sqrt(bholeB.w*bholeB.w-4*bholeB.z*bholeB.z))/2;
+
+    vec2 pos = vec2(texCoords);
+    transformKerr(ogcamPos, camPos);
+    vec3 camVel = adjKerrVel(ogcamVel, camPos, ogcamPos);
+    float camSpeed = length(camVel);
+
+    pos = (pos-0.5*res)/(res.y/2);
+
+    //takes into account relativistic abberation
+
+    vec4 color = vec4(0, 0, 0, 1);
+    mat4 move = mat4(1.0f);
+    move[3] = view[3];
+
+    mat4 look = mat4(1.0f);
+    look[0] = view[0];
+    look[1] = view[1];
+    look[2] = view[2];
+
+
+    if(aP < 0.5){
+        rayOg = camPos + vec3(0, 0.75, 0);
+    }
+    else{
+        rayOg = (move*vec4(-15, 0, 0.0, 1)).xyz;
+        //rayOg = (move*vec4(camPos, 1)).xyz;
+    }
+
+    vec3 nd = normalize(vec3(pos.xy+0.01f, 2.16647259748));
+
+    if(aP < 0.5){
+        //nd = rotate(nd, camVel);
+    }
+
+    vec3 oldRd = normalize((look*vec4(nd, 1)).xyz);
+
+    vec3 rd;
+    if(aP < 0.5){
+        rd = adjustFov(camVel, oldRd);
+    }
+    else{
+        rd = oldRd;
+    }
+
+    //ray origin in new coordinates: cartesian -> new coordinates
+    vec3 altRO = intConversionKerr(rayOg);
+
+    camPosKerr = altRO;
+
+    //light velocity vector components in new coordinates: cartesian -> new coordinate vectors
+    vec4 altRD = adjustLightKerr(rd, rayOg, altRO);
+    
+    //begins raymarching light ray
+    color.xyz = raymarch(altRO, altRD.xyz);
+
+    imageStore(imgOutput, texCoords, color);         
+}
+
+vec3 rotate(vec3 nd, vec3 camVl){
+    vec3 camVel = camVl;
+    vec3 axisRt = normalize(cross(vec3(0, 0, 1), nd));
+    vec3 axis = -normalize(cross(normalize(camVel), vec3(0, 0, 1)));
+    //axis.y = abs(axis.y);
+    //axis = vec3(0);
+    float cosT = normalize(camVel).z;
+    float c = 1-cosT;
+    float s = sqrt(1-cosT*cosT);
+    vec3 colOne = vec3(cosT + c*(axis.x*axis.x), (axis.y*axis.x)*c+0*axis.z*s, (axis.z*axis.x)*c-(axis.y)*s);
+    //colOne = vec3(1, 0, 0);
+    vec3 colTwo = vec3(axis.y*axis.x*c-axis.z*s, cosT+axis.y*axis.y*c, axis.z*axis.y*c+axis.x*s);
+    //colTwo = vec3(0, 1, 0);
+    vec3 colThree = vec3(axis.z*axis.x*c+axis.y*s, axis.z*axis.y*c-axis.x*s, cosT+axis.z*axis.z*c);
+    //colThree = vec3(0, 0, 1);
+    mat3 rot = mat3(colOne, colTwo, colThree);
+    axis = rot*axisRt;
+
+    cosT = nd.z;
+    c = 1-cosT;
+    s = sqrt(1-cosT*cosT);
+    colOne = vec3(cosT+axis.x*axis.x*c, axis.y*axis.x*c+axis.z*s, axis.z*axis.x*c-axis.y*s);
+    colTwo = vec3(axis.y*axis.x*c-axis.z*s, cosT+axis.y*axis.y*c, axis.z*axis.y*c+axis.x*s);
+    colThree = vec3(axis.z*axis.x*c+axis.y*s, axis.z*axis.y*c-axis.x*s, cosT+axis.z*axis.z*c);
+    rot = mat3(colOne, colTwo, colThree);
+    vec3 newRd = rot*camVel;
+    return newRd;  
+}
+
+vec3 adjustFov(vec3 camVel, vec3 rd){
+    vec3 axis = normalize(cross(camVel, rd));
+    float speed = length(camVel);
+    vec3 normCam = normalize(camVel);
+    float oldCos = dot(normalize(camVel), rd);
+
+    float cosT = (oldCos - speed)/(1-speed*oldCos);
+    float c = 1-cosT;
+    float s = sqrt(1-cosT*cosT);
+    vec3 colOne = vec3(cosT+axis.x*axis.x*c, axis.y*axis.x*c+axis.z*s, axis.z*axis.x*c-axis.y*s);
+    vec3 colTwo = vec3(axis.y*axis.x*c-axis.z*s, cosT+axis.y*axis.y*c, axis.z*axis.y*c+axis.x*s);
+    vec3 colThree = vec3(axis.z*axis.x*c+axis.y*s, axis.z*axis.y*c-axis.x*s, cosT+axis.z*axis.z*c);
+    mat3 rot = mat3(colOne, colTwo, colThree);
+    vec3 newRd = rot*normCam;
+    return newRd;
+}
+
+vec3 raymarch(vec3 ro, vec3 rd){
+    float dO = 0.;
+    float d = 0.;
+    vec3 rayPos = ro;
+    vec3 color = 0*lightEnergy * cloudCol;
+    vec3 rdk2;
+
+    vec3 k1;
+    vec3 k2;
+    vec3 j1;
+    vec3 j2;
+    float maxst = maxsteps;
+
+    dt = timestep + timeDT;
+
+    //vector variable for cartesian position
+    vec3 cartP;
+    vec4 dS;
+
+    for (int i = 0; i < maxst + 1000*rays; i ++){
+        
+        //transforms the ray position back into cartesian coordinates for SDFs
+        transformKerr(rayPos, cartP);
+
+        dS = GetDistCol(cartP, 0);
+
+        //color = lightEnergy * cloudCol;
+        universalRay = rayPos;
+
+        if(length(cartP.xz) < 2){
+            maxst = maxsteps + 1500;
+        }
+
+        if(rayPos.x/EH < 1.001){
+            break;
+        }
+
+        if(dS.w < surfdis){
+            color = getLight(cartP, dS.xyz);
+            break;
+        }
+
+        //dynamically rescales timestep according to distance away from blackhole and observer
+        float x = length(cartP - rayOg);
+        float b = 0.2;
+        float a = 10.8;
+        dt = (timestep + timeDT) * (13/(1+pow(econst, -b*(x/2-a)))+1);
+        if(length(cartP.xz) < 5){
+            dt *= pow(length(cartP.xz)/5, 0.95);
+        }
+        
+        //geodesic equations
+        geodesicKerr(rd, rayPos, bholeB, j1);
+        j1 *= dt;
+        k1 = rd*dt;
+
+        if(length(cartP.xz) > 25){
+            rd += j1;
+            rayPos += rd*dt;    
+        }
+        else{
+            geodesicKerr(rd + j1, rayPos+k1, bholeB, j2);
+            j2 *= dt;
+            k2 = (rd + j1/2)*dt;
+
+            rd += (j1 + j2)/2;    
+            rayPos += (k1 + k2)/2;    
+        }
+    }
+
+    float rShift = redShift(universalRay, camPosKerr);
+
+    //color *= vec3(rShift, 1, 1/rShift);
+
+    color += lightEnergy * cloudCol;
+
+    return color;
+}
+
+vec4 adjustLight(in vec3 rd, in vec3 ro, in vec3 spRo)
+{
+    vec3 pos = ro;
+
+    //distance away from blackhole
+    float r = spRo.x;
+    float sinT = sin(spRo.y);
+    float cosT = cos(spRo.y);
+    float sinP = sin(spRo.z);
+    float cosP = cos(spRo.z);
+    //schwarzchild radius
+    float rs = bholeA.w;
+
+    float p = length(pos.xz);
+
+    //1) rad 2) theta 3) phi 4) time
+    vec4 tetrad = vec4(sqrt(1-rs/r), 1/r, 1/(r*sinT), 0);
+    timeVel = 1/sqrt(1-rs/r);
+
+    //polar unit vectors
+    vec3 rvec = vec3(sinT*cosP, cosT, sinT*sinP);  //radial unit vector
+    vec3 tvec = vec3(cosT*cosP, -sinT, cosT*sinP);  //phi unit vector
+    vec3 pvec = vec3(-sinP, 0, cosP);  //theta unit vector
+
+    //gets 4 velocity in terms of new orthonomal vectors
+    vec4 altVels = vec4(dot(rd, rvec), dot(rd, tvec), dot(rd, pvec), 0);
+
+    //new 4 velocity
+    vec4 adjVels = altVels*tetrad;
+
+    //light ray calibrated to schwarzchild coordinates
+    return adjVels;
+}
+
+vec4 adjustLightKerr(in vec3 rd, in vec3 ro, in vec3 altRo)
+{
+    float x = ro.x;
+    float z = ro.z;
+    float d = length(ro.xz);
+
+    //spin parameter
+    float a = bholeB.z;;
+    //r coordinates
+    float r = altRo.x;
+    float sinT = sin(altRo.y);
+    float cosT = cos(altRo.y);
+    float sinP = sin(altRo.z);
+    float cosP = cos(altRo.z);
+    //schwarzchild radius
+    float rs = bholeB.w;
+
+    timeVel = 1;
+
+    float p = sqrt(r*r+a*a*cosT*cosT);
+    float tri = r*r-rs*r+a*a;
+
+    //float p = length(pos.xz);
+    //common term
+    float E = 1/sqrt(r*r+a*a*cosT*cosT);
+    float f = sqrt(r*r+a*a);
+
+    //1) rad 2) theta 3) phi 4) time
+    vec4 tetrad = vec4(sqrt(tri)/p, 1/p, sqrt(((p*p-rs*r)/tri))/(p*sinT), 0);
+    //timeVel = 1/sqrt(1-rs/r);
+
+    //polar unit vectors
+    vec3 rvec = vec3(r*sinT*cosP, cosT*f, r*sinT*sinP) * E;  //rCoord unit vector
+    vec3 tvec = vec3(f*cosT*cosP, -r*sinT, f*cosT*sinP) * E; //theta unit vector
+    vec3 pvec = vec3(-sinP, 0, cosP); //phi unit vector
+
+    //gets 4 velocity in terms of new orthonomal vectors
+    vec4 altVels = vec4(dot(rd, rvec), dot(rd, tvec), dot(rd, pvec), 0);
+
+    //new 4 velocity
+    vec4 adjVels = altVels*tetrad;
+
+    //light ray calibrated to schwarzchild coordinates
+    return adjVels;
+}
+
+void geodesicKerr(in vec3 rd, in vec3 position, in vec4 bPos, out vec3 newrd){
+    //adjust pos variable to be relative to black hole
+    //vec3 pos = position - bPos.xyz;
+    float rs = bPos.w;
+    float a = bPos.z;
+
+    //distance away from blackhole
+    float r = position.x;
+
+    //theta angle
+    float theta = abs(position.y);
+    float sint = sin(theta);
+    float cost = cos(theta);
+
+    float tri = r*r-rs*r+a*a;
+    float p = r*r + a*a*cost*cost;
+
+    //schwarzchild radius
+    float diff = r - rs;
+
+    //theta and phi rate of change from velocity vectors
+    float rdot = rd.x;
+    float tdot = rd.y;
+    float pdot = rd.z;
+
+    //three velocities
+    vec3 THVels = vec3(rdot, tdot, pdot);
+
+    //repeated term
+    float[4][6][6] chrSym = christoffelSymbols(vec2(r, theta));
+    timeVel = 1;
+
+    //adjustment term for coordinate time
+    vec4 coordTval = 2*vec4(chrSym[0][0][1], chrSym[0][0][2], chrSym[0][1][3], chrSym[0][2][3]);
+    coordTval *= vec4(timeVel*rdot, timeVel*tdot, rdot*pdot, tdot*pdot);
+
+    float radA;
+    float thetaA;
+    float phiA;
+
+    if(rs > 0){
+        //rad acceleration vector
+        radA = -chrSym[1][0][0]*timeVel*timeVel-2*(chrSym[1][0][3]*timeVel*pdot) - chrSym[1][1][1]*rdot*rdot-2*chrSym[1][1][2]*rdot*tdot-chrSym[1][2][2]*tdot*tdot-chrSym[1][3][3]*pdot*pdot + dot(coordTval, THVels.xxxx);
+        //theta acceleration vector
+        thetaA = -chrSym[2][0][0]*timeVel*timeVel - 2*chrSym[2][0][3]*timeVel*pdot-chrSym[2][1][1]*rdot*rdot-2*chrSym[2][1][2]*rdot*tdot - chrSym[2][2][2]*tdot*tdot - chrSym[2][3][3]*pdot*pdot + dot(coordTval, THVels.yyyy);
+        //phi acceleration vector
+        phiA = -2*timeVel*(chrSym[3][0][1]*rdot+chrSym[3][0][2]*tdot)-2*pdot*(chrSym[3][1][3]*rdot+chrSym[3][2][3]*tdot) + dot(coordTval, THVels.zzzz);
+    
+    }
+    //non curved geodesics
+    else{
+        radA = r*(tdot*tdot+sint*sint*pdot*pdot);
+        thetaA = (-2/r)*rdot*tdot+cost*sint*pdot*pdot;
+        phiA = (-2/r)*rdot*pdot-(2*cost/sint)*tdot*pdot;
+    }
+    //converting polar velocity vectors to cartesian velocity vectors
+    //newrd = polVels.x * rvec + polVels.y * tvec + polVels.z * pvec;
+    newrd = vec3(radA, thetaA, phiA);
+    //adjustLight(newrd1, position, newrd1);
+    //newrd = newrd1;
+}
+
+void geodesic(in vec3 rd, in vec3 position, in vec4 bPos, out vec3 newrd){
+    //adjust pos variable to be relative to black hole
+    //vec3 pos = position - bPos.xyz;
+
+    //distance away from blackhole
+    float r = position.x;
+
+    //theta angle
+    float theta = position.y;
+
+    //schwarzchild radius
+    float rs = bPos.w;
+
+    //theta and phi rate of change from velocity vectors
+    float rdot = rd.x;
+    float tdot = rd.y;
+    float pdot = rd.z;
+
+    //repeated term
+    float diff = r - rs;
+
+    //adjustment term for coordinate time
+    float coordTval = (rs/(2*r*(diff)))*(rdot)*timeVel;
+
+    //radial acceleration term
+
+    //rad acceleration vector
+    float radA = (rs/(2.0f*r*(diff)))*(rdot*rdot) + (diff)*(tdot*tdot+sin(theta)*sin(theta)*pdot*pdot) + (rs*(-diff)/(2.0f*r*r*r))*timeVel*timeVel+coordTval*rdot;
+    //theta acceleration vector
+    float thetaA = (-2/r)*rdot*tdot+0.5*sin(2*theta)*pdot*pdot+coordTval*tdot;
+    //phi acceleration vector
+    float phiA = (-2/r)*rdot*pdot-(2/tan(theta))*tdot*pdot + coordTval*pdot;
+
+    //non curved geodesics
+    //float radA = r*(tdot*tdot+sin(theta)*sin(theta)*pdot*pdot);
+    //float thetaA = (-2/r)*rdot*tdot+cos(theta)*sin(theta)*pdot*pdot;
+    //float phiA = (-2/r)*rdot*pdot-(2*cos(theta)/sin(theta))*tdot*pdot;
+    //converting polar velocity vectors to cartesian velocity vectors
+    //newrd = polVels.x * rvec + polVels.y * tvec + polVels.z * pvec;
+    newrd = vec3(radA, thetaA, phiA);
+    //adjustLight(newrd1, position, newrd1);
+    //newrd = newrd1;
+}
+
+
+vec4 GetDistCol(vec3 p, int hit){
+    float d = GetDist(p);
+    vec3 adjD = (p);
+    vec4 cold = vec4(0.0, 0.0, 0.0, d);
+    float sphDist = radG-length(adjD);
+    vec2 galcoord;
+    float thetC = atan(-adjD.z,adjD.x);
+    float u = (thetC + PI)/(2*PI);
+    float phiC = acos(-adjD.y/radG);
+    float v = phiC/PI;
+    float colorAdj = lightSamples;
+    if(d == sphDist){
+        galcoord = vec2(u, v);
+        cold.xyz = texture(galaxy, galcoord).xyz;
+    }
+    vec3 cloudColor = lightEnergy * cloudCol;
+    cold.xyz = cold.xyz*colorAdj;
+    if(hit > 0.5){
+        cold.xyz = cloudColor;
+    }
+
+    float rShift = redShift(universalRay, camPosKerr);
+
+    return cold * vec4(rShift, 1, 1/rShift, 1);
+}
+
+float GetDist(vec3 p){
+    //light ray search radius: how many grids in the texture atlast it will look through (Squared)
+    const int lrad = 2;
+
+    float d = 100;
+
+    //particle position
+    vec2 density = vec2(0);
+
+    vec2 atlastest;
+    float sDist;
+    float totalDensity = 0;
+
+    //factor for how much the cloud absorbs
+    float cloudAbs = 2;
+    float phase = 3;
+
+    if(abs(p.x) < 16 && abs(p.z) < 16 && abs(p.y) < 1.5/yScale && length(p) > 2){
+        float lightTrans = lightmarch(p);
+        for(int i = 0; i < lrad; i ++){
+        for(int j = 0; j < lrad; j ++){
+            density = densityFunc(p, ivec2(i,j));
+            totalDensity += density.x;
+        }
+        }
+        totalDensity /= 4;
+        lightEnergy += totalDensity * dt * lightSamples * lightTrans * phase;
+        lightSamples *= pow(econst, -totalDensity * dt * cloudAbs);
+    }
+
+    vec3 adjD = (p);
+    float sphDist = radG-length(adjD);
+    d = min(d, sphDist);
+    return d;
+}
+
+float lightmarch(vec3 pos){
+    vec3 p = pos;
+    vec3 dirToLight = normalize(globalLight);
+    float stepSize = 0.08;
+    vec2 density = vec2(0);
+    float totalDensity = 0;
+    float dkThreshold = 0.05;
+    float sunAbs = 2;
+    float maxlSteps = 7;
+
+    for (int t = 0; t < maxlSteps; t ++){
+        density = densityFunc(p, ivec2(0));
+        totalDensity += density.x*stepSize*(1-density.y);
+        p += dirToLight*stepSize;
+        if(abs(p.x) > 16 || abs(p.z) > 16 || abs(p.y) > 1.5/yScale || totalDensity*sunAbs > 10 || length(p) < 2){
+            break;
+        }
+    }
+    float transmit = exp(-totalDensity * sunAbs);
+    return dkThreshold + transmit*(1-dkThreshold);
+}
+
+float redShift(vec3 rayP, vec3 camP){
+    float a = bholeB.z;
+    float rs = bholeB.w;
+
+    float rCam = camP.x;
+    float rRay = rayP.x;
+    float cosCam = cos(camP.y);
+    float cosRay = cos(rayP.y);
+
+    float eCam = rCam*rCam + a*a*cosCam*cosCam;
+    float eRay = rRay*rRay + a*a*cosRay*cosRay;
+
+    float gttCam = 1 - rs*rCam/eCam;
+    float gttRay = 1 - rs*rRay/eRay;
+
+    return sqrt(gttCam/gttRay);
+}
+
+vec2 densityFunc(vec3 pos, ivec2 ij){
+    vec3 p = pos;
+
+    float gscale = 12.8;
+    vec2 density = vec2(0);
+
+    vec3 noiseF = (1-2*texture(noise, vec2(p.xz + p.xy + p.yz)/60).xyz) * vec3(0.2, 0.2, 0.1);
+    vec3 nP = p.xyz + noiseF;
+
+    vec3 noiseU = (1-2*texture(lowResNoise, vec2(nP.xz + nP.xy + nP.yz)/20).xyz) * vec3(0.02, 0.03, 0.02);
+
+    nP += noiseU;
+
+    int atlY = clamp(int(nP.y * 25.6*yScale), -32, 31) + 32;
+    ivec2 atlXZ = ivec2(clamp((nP.x*gscale), -256, 256), clamp((nP.z*gscale), -256, 256)); 
+
+    int row = int(floor(atlY/8));
+    int col = atlY - row*8;
+    ivec2 adjTerm = ivec2(col, row) * 512 + ivec2(256) + atlXZ;
+
+    vec2 atlasPosT = ij + adjTerm;
+    atlasPosT /= texRes;
+
+    density = texture(particleAtlas, atlasPosT).xy;
+    return density;
+}
+
+vec3 compare(vec3 one, vec3 two, vec3 three){
+    vec3 final = one;
+    vec3 onetwo = (one-two)/two;
+    vec3 onethree = (one-three)/three;
+    vec3 twothree = (two-three)/three;
+    if(abs(onetwo.x) < 0.05 && abs(onetwo.y) < 0.05 && abs(onetwo.z) < 0.05)
+    {
+        final = one;
+    }
+    if(abs(onethree.x) < 0.05 && abs(onethree.y) < 0.05 && abs(onethree.z) < 0.05)
+    {
+        final = two;
+    }
+    if(abs(twothree.x) < 0.05 && abs(twothree.y) < 0.05 && abs(twothree.z) < 0.05)
+    {
+        final = three;
+    }
+    return final;
+}
+
+vec3 getLight(vec3 p, vec3 col){
+    vec3 lColor = lightEnergy * cloudCol;
+    //vec3 lColor = vec3(0.9098, 0.0, 0.0);
+
+    //if(col != vec3(0.0f)){
+        lColor = col;
+    //}
+
+    vec3 l = normalize(globalLight - p);
+    vec3 n = GetNormal(p);
+
+    float dif = clamp(dot(n, l), 0.0, 1.0);
+    //float dif = dot(n, l)+0.5;
+
+    return dif * lColor;
+}
+
+vec3 GetNormal(vec3 p){
+    float d = GetDist(p);
+    vec2 e = vec2(.01, 0);
+
+    vec3 n = d - vec3(
+        GetDist(p - e.xyy),
+        GetDist(p - e.yxy),
+        GetDist(p - e.yyx)
+    );
+
+    return normalize(n);
+}
+
+//spherical to cartesian coordinates
+void transform(in vec3 sphComp, out vec3 cartPos){
+    float radius = sphComp.x;
+    float theta = sphComp.y;
+    float phi = sphComp.z;
+
+    float x = radius * sin(theta) * cos(phi);
+    float y = radius * cos(theta);
+    float z = radius * sin(theta) * sin(phi);
+
+    //outputs cartesian coordinates
+    cartPos = vec3(x, y, z);
+}
+
+//gets initial spherical coordinates from initial cartesian coordinates
+vec3 intConversion (in vec3 pos)
+{
+    //initial radius component
+    float p = length(pos.xz);
+
+    float intRad = length(pos);
+    //initial theta component
+    float intTheta = acos(pos.y/intRad);
+
+    float intPhi = atan2(pos.z, pos.x);
+    if(pos.x == 0){
+        intPhi = 0;
+    }
+
+    //outputs the initial spherical coordinates
+    return vec3(intRad, intTheta, intPhi);
+}
+
+vec3 adjKerrVel(vec3 camVel, vec3 camPos, vec3 ogCamPos){
+    vec3 camBoyer = camVel;
+    float theta = ogCamPos.y;
+    float phi = ogCamPos.z;
+    float r = ogCamPos.x;
+    float a = bholeB.z;
+    float rs = bholeB.w;
+
+    float sint = sin(theta);
+    float cost = cos(theta);
+    float sinp = sin(phi);
+    float cosp = cos(phi);
+
+    float p = sqrt(r*r+a*a*cost*cost);
+    float tri = r*r-rs*r+a*a;
+
+    float E = 1/sqrt(r*r+a*a*cost*cost);
+    float f = sqrt(r*r+a*a);
+
+    vec4 tetrad = vec4(sqrt(tri)/p, 1/p, sqrt(((p*p-rs*r)/tri))/(p*sint), 1);
+
+    vec3 rvec = vec3(r*sint*cosp, cost*f, r*sint*sinp) * E;  //rCoord unit vector
+    vec3 tvec = vec3(f*cost*cosp, -r*sint, f*cost*sinp) * E; //theta unit vector
+    vec3 pvec = vec3(-sinp, 0, cosp);
+
+    camBoyer /= tetrad.xyz;
+
+    vec3 finalVel = rvec*camBoyer.x + tvec*camBoyer.y + pvec*camBoyer.z;
+
+    return finalVel;
+}
+
+vec3 intConversionKerr (vec3 pos){
+    float a = bholeB.z*bholeB.z;
+    float d = dot(pos, pos);
+    float y = pos.y;
+
+    float rCoord = sqrt((d-a+sqrt((d-a)*(d-a)+4*a*y))/2);
+    float tCoord = acos(y/rCoord);
+    float pCoord = atan2(pos.z, pos.x);
+
+    return vec3(rCoord, tCoord, pCoord);
+}
+
+void transformKerr(in vec3 oblateCoord, out vec3 cartPos){
+    float r = oblateCoord.x;
+    float tCoord = oblateCoord.y;
+    float pCoord = oblateCoord.z;
+    float a = bholeB.z;
+
+    float x;
+    float y;
+    float z; 
+
+    if(over < 0.5){
+        x = sqrt(r*r+a*a) * sin(tCoord) * cos(pCoord);
+        y = r * cos(tCoord);
+        z = sqrt(r*r+a*a) * sin(tCoord) * sin(pCoord);
+    }
+    else{
+        x = sqrt(r*r+a*a) * cos(tCoord) * cos(pCoord);
+        y = r * sin(tCoord);
+        z = sqrt(r*r+a*a) * cos(tCoord) * sin(pCoord);
+    }
+
+    //outputs cartesian coordinates
+    cartPos = vec3(x, y, z);
+}
+
+float atan2(in float y, in float x)
+{
+    return x == 0.0 ? sign(y)*PI/2 : atan(y, x);
+}
+
+float[4][6][6] christoffelSymbols(vec2 rt){
+    float r = rt.x;
+    float theta = rt.y;
+    float sint = sin(theta);
+    float cost = cos(theta);
+    float rs = bholeB.w;
+    float a = bholeB.z;
+
+    //triangle symbol
+    float tri = r*r-r*rs+a*a;
+    float p = r*r+a*a*cost*cost;
+
+    float rp = 2*r*r-p;
+    float ra = r*r+a*a;
+    float ar = r*r-a*a;
+    float sc = sint*cost;
+    float ss = sint*sint;
+    float pq = p*p;
+    float ps = p*p*p;
+    float[4][6][6] christoffelKerr;
+    
+    //time components
+    christoffelKerr[0][0][1] = (rs*ra*rp/(2*pq*tri));
+    christoffelKerr[0][0][2] = (-a*a*rs*r*sc/(pq));
+    christoffelKerr[0][1][3] = ((-rs*a*ss)*(p*(ar)+2*r*r*(ra)))/(2*pq*tri);
+    christoffelKerr[0][2][3] = (rs*a*a*a*r)*(sc*ss)/(pq);
+
+    //radial components
+    christoffelKerr[1][0][0] = rs*tri*rp/(2*ps);
+    christoffelKerr[1][0][3] = (-rs*a*tri*rp*ss/(2*ps));
+    christoffelKerr[1][1][1] = (2*r*a*a*ss-rs*(rp))/(2*p*tri);
+    christoffelKerr[1][1][2] = (-a*a*sc/p);
+    christoffelKerr[1][2][2] = (-r*tri)/p;
+    christoffelKerr[1][3][3] = (tri*ss)*(rs*a*a*ss*rp-2*r*pq)/(2*ps);
+
+    //theta components
+    christoffelKerr[2][0][0] = -a*a*rs*r*sc/ps;
+    christoffelKerr[2][0][3] = a*rs*r*ra*sc/ps;
+    christoffelKerr[2][1][1] = a*a*sc/(p*tri);
+    christoffelKerr[2][1][2] = r/p;
+    christoffelKerr[2][2][2] = christoffelKerr[1][1][2];
+    christoffelKerr[2][3][3] = (pq/(rs*r)+(1+p/ra)*a*a*ss)*(-ra*rs*r*sc)/(ps);
+
+    //phi components
+    christoffelKerr[3][0][1] = rs*a*rp/(2*pq*tri);
+    christoffelKerr[3][0][2] = -rs*a*r*cost/(pq*sint);
+    christoffelKerr[3][1][3] = rs*(a*a*a*a*sc*sc-r*r*(ra+p-2*pq/(rs*r)))/(2*pq*tri);
+    christoffelKerr[3][2][3] = cost*(pq+r*a*a*rs*ss)/(pq*sint);
+    //if(sint < 2){
+        //christoffelKerr[3][0][1] = 0;
+        //christoffelKerr[3][0][2] = 0;
+        //christoffelKerr[3][1][3] = 0;
+        //christoffelKerr[3][2][3] = 0;
+    //}
+    return christoffelKerr;
+}
+
+float autoDif(float test){
+    return test;
+}

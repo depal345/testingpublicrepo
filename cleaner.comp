@@ -1,0 +1,22 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(rgba32f, binding = 2) uniform image2D atlas;
+
+void main()
+{
+
+    //ivec2 posCoord = ivec2(gl_GlobalInvocationID.xy);
+
+    //const int wid = 8;
+    //const int hei = 8;
+
+    //vec4 black = vec4(0.0f);
+
+    //for (int i = 0; i < wid; i ++){
+    //for (int j = 0; j < hei; j ++){
+        //ivec2 coord = posCoord * 8 + ivec2(i, j);   
+        //imageStore(atlas, coord, vec4(0));  
+    //}
+    //}
+}

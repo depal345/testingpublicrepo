@@ -1,0 +1,159 @@
+#version 460
+
+#define PI 3.14159265358
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(rgba32f, binding = 2) uniform image2D imgOutput;
+
+uniform sampler2D prevSample;
+uniform float time;
+uniform int tru;
+
+float dt = 0.004;
+
+//void geodesic(in vec4 pos, in vec4 velocity, out vec4 outPos);
+void circle(in vec2 square, in vec2 size, out vec2 cirlce);
+void geodesic(in vec4 velocity, in vec3 pos, in vec4 bhole, precise out vec4 newvelocity);
+ivec2 clamper(vec2 samp)
+{
+    vec2 test;
+    test.x = clamp(samp.x, -1024, 1024);
+    test.y = clamp(samp.y, -1024, 1024);
+    return ivec2(test);
+}
+
+float tSc = 0.5;
+
+vec4 bholeA = vec4(0*4*cos(tSc*2*time+PI/2), -10, 0*4*sin(tSc*2*time+PI/2), 0.5);
+
+vec2 texRes = vec2(512+2048);
+
+void main()
+{
+    //position in the compute shader
+    vec2 globalCoord = vec2(gl_GlobalInvocationID.xy);
+    ivec2 posCoord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 velCoord = ivec2(gl_GlobalInvocationID.xy) + ivec2(512, 0);
+    vec2 scaleFactor = vec2(0.01, 1);
+
+    vec4 presults = texture(prevSample, vec2(posCoord + 0.1f)/texRes);
+    vec4 vresults = texture(prevSample, vec2(velCoord + 0.1f)/texRes);
+    //texture position
+    //vec2 texPos = vec2(globCoord)/1536.;
+    vec4 pos;
+    vec4 vels;
+    vec4 test;
+
+    //vec4 testPos = vec4(3, 6, 8, 1);
+    if(tru == 1){
+        circle(vec2(globalCoord.xy*scaleFactor), vec2(512), globalCoord.xy);
+        vec4 initialPositions = vec4(globalCoord.x, 10, globalCoord.y, 0.0f);
+        //pos = vec4(10.*(globalCoord.x-256)/512., 10, 10.*(globalCoord.y-256)/512., 0.01);
+        pos = vec4(initialPositions.xyz, 0.03);
+        vels = vec4(-0.15, 0*-0.12f, 0*-0.13, 0);
+    }
+    else{
+        pos = presults;
+        vels = vresults;
+    }
+
+    vec4 k1;
+    vec4 k2;
+    vec4 j1;
+    vec4 j2;
+
+    for(int i = 0; i < 50; i ++)
+    {
+        geodesic(vels, pos.xyz, bholeA, j1);
+        j1 *= dt;
+        k1 = vels*dt;
+        geodesic(vels + j1, pos.xyz + k1.xyz, bholeA, j2);
+        j2 *= dt;
+        k2 = (vels + j1/2)*dt;
+
+        vels += (j1+j2)/2;
+        pos += (k1+k2)/2;
+        //geodesic(pos, vels, pos);
+    }
+
+    ivec2 newxz = clamper(vec2(pos.xz*102.4));
+    //ivec2 newxy = clamper(vec2(pos.xy*51.2));
+    //ivec2 newyz = clamper(vec2(pos.yz*51.2));
+
+    ivec2 adjPosxz = newxz + ivec2(1536);
+
+    imageStore(imgOutput, posCoord, pos);    
+    imageStore(imgOutput, velCoord, vels);   
+    imageStore(imgOutput, adjPosxz, pos);
+    //imageStore(imgOutput, adjPosxy, pos); 
+    //imageStore(imgOutput, adjPosyz, pos);  
+}
+
+//void geodesic(in vec4 pos, in vec4 velocity, out vec4 outPos)
+//{
+    //float dt = 0.01;
+    //velocity.z *= c;
+    //outPos = vec4(pos.xyz + velocity.xyz*dt, 0.01);       
+//}
+
+void geodesic(in vec4 velocity, in vec3 pos, in vec4 bhole, precise out vec4 newvelocity)
+{
+
+    //float dt = 0.001;
+
+    float r = length(pos+bhole.xyz);
+    float rs = bhole.w;
+    //rs += rs*1000*t;
+
+    float timeVel = 1/(1-rs/r);
+    //float tdot = (velocity.w/(r*r))/timeVel;
+
+    pos = normalize(pos+bhole.xyz);
+
+    vec3 altPos = pos;
+
+    precise float cost = pos.z;
+    precise float sint = length(pos.xy);
+    precise float cosp = normalize(altPos.xy).x;
+    precise float sinp = normalize(altPos.xy).y;
+
+    //testing alternate conversion factors
+    float yval = pos.y;
+    float xval = pos.x;
+    float zval = pos.z;
+    
+    mat3 combo = mat3(vec3(xval, yval, zval), vec3(cost*cosp, cost*sinp, -sint), vec3(-sinp, cosp, 0));
+    
+    //mat3 combo = mat3(vec3(sint*cosp, sint*sinp, cost), vec3(cost*cosp, cost*sinp, -sint), vec3(-sinp, cosp, 0));
+    combo = transpose(combo);
+
+    vec3 polVels = combo*velocity.xyz;
+
+    float tdot = polVels.y/r;
+    float pdot = polVels.z/(r*sint);
+
+    float corvalue = (rs/(r*(r-rs)))*(polVels.x);
+
+    float radA = (rs/(2.0f*r*(r-rs)))*(polVels.x*polVels.x) + (-rs)*(tdot*tdot+sint*sint*pdot*pdot) + (rs*(rs-r)/(2.0f*r*r*r))*(1)+corvalue*polVels.x;
+    float ar = radA;
+
+    //float radT = (-2/r)*polVels.x*tdot+corvalue*tdot;
+    float at = r*corvalue*tdot;
+    float ap = r*sint*corvalue*pdot;
+    polVels.x = ar;
+    polVels.y = at;
+    polVels.z = ap;
+
+    velocity.xyz = inverse(combo) * polVels;
+    velocity.w = timeVel;
+    
+    newvelocity = velocity;
+}
+
+void circle(in vec2 rect, in vec2 size, out vec2 circle)
+{
+    float r = rect.x+1.5;
+    float angle = 2*PI * rect.y/size.y;
+
+    vec2 circ = vec2(r*cos(angle), r*sin(angle));
+    circle = circ;
+}

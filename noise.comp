@@ -1,0 +1,30 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(rgba32f, binding = 1) uniform image2D imgOutput;
+layout(rgba32f, binding = 2) uniform image2D atlas;
+
+uniform sampler2D noiseTexture;
+uniform sampler2D particle;
+
+vec2 texRes = vec2(512+2048);
+
+void main()
+{
+
+    ivec2 posCoord = ivec2(gl_GlobalInvocationID.xy);
+
+    const int wid = 4;
+    const int hei = 4;
+
+    vec4 black = vec4(0.0f);
+
+    //for (int i = 0; i < wid; i ++){
+        //for (int j = 0; j < hei; j ++){
+            //ivec2 coord = posCoord*4 + ivec2(512) + ivec2(i, j);
+            //vec4 noise = texture(noiseTexture, (vec2(coord) - vec2(512))/450);
+            //vec4 partPos = texture(particle, coord/texRes + 0*vec2(0.005*noise.x, -0.01*noise.y));
+            //imageStore(imgOutput, coord, partPos);    
+        //}
+    //}
+}

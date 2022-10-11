@@ -1,0 +1,427 @@
+#version 460 core
+#define maxsteps 2600
+#define maxdist 200
+#define surfdis 0.025
+#define PI 3.14159265359
+#define timestep 0.025
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(rgba32f, binding = 0) uniform image2D imgOutput;
+
+uniform vec2 res;
+uniform float time;
+uniform float fov;
+uniform float rays;
+uniform float timeDT;
+uniform mat4 view;
+uniform sampler2D testSample;
+uniform sampler2D galaxy;
+uniform vec3 camog;
+
+float GetDist(vec3 p);
+vec4 GetDistCol(vec3 p);
+vec3 raymarch(vec3 ro, vec3 rd);
+vec3 getLight(vec3 p, vec3 col);
+vec3 GetNormal(vec3 p);
+vec3 GetNormal(vec3 p);
+float sdTorus(vec3 p, vec2 r);
+void geodesic(in vec3 rd, in vec3 position, in vec4 bPos, out vec3 newrd);
+void adjustLight(in vec3 rd, in vec3 ro, out vec3 initialRD);
+
+//converts spherical components into cartesian Position vectors
+void transform(in vec3 sphComp, out vec3 cartPos);
+float mandelbulbSDF(vec3 p, float power);
+
+vec3 compare(vec3 one, vec3 two, vec3 three);
+
+vec2 texRes = vec2(512+2048);
+
+//time scale
+float tSc = 0.5;
+float radG = 50;
+vec4 bholeA = vec4(0*4*cos(tSc*2*time+PI/2), 0, 0*4*sin(tSc*2*time+PI/2), 1);
+
+void main()
+{
+    ivec2 texCoords = ivec2(gl_GlobalInvocationID.xy);
+    vec3 camPos = texture(testSample, vec2(512 - 0.1f)/(512+2048)).xyz;
+
+    vec2 pos = vec2(texCoords);
+
+    pos = (pos-0.5*res)/(res.y/2);
+
+    vec3 col = vec3(0);
+    mat4 move = mat4(1.0f);
+    move[3] = view[3];
+
+    mat4 look = mat4(1.0f);
+    look[0] = view[0];
+    look[1] = view[1];
+    look[2] = view[2];
+
+    vec3 ro = (move*vec4(0, 0, 0.0, 1)).xyz;
+    //vec3 ro = camPos + vec3(0, 0, 0);
+    float a = PI/7;
+    vec3 nd = normalize(vec3(pos.xy+0.01f, 2));
+    vec3 rd = normalize((look*vec4(nd, 1)).xyz);
+
+    //adjusts light rays according to schwarzchild coordinates
+    adjustLight(rd, ro, rd);
+    
+    col = raymarch(ro, rd);
+
+    vec4 color = vec4(col, 1);
+
+    imageStore(imgOutput, texCoords, color);         
+}
+
+vec3 raymarch(vec3 ro, vec3 rd){
+    float dO = 0.;
+    float d = 0.;
+    vec3 p = ro;
+    vec2 acc = vec2(0.5, 0.5);
+    vec3 color = vec3(0);
+    vec3 rdk2;
+
+    vec3 k1;
+    vec3 k2;
+    vec3 k3;
+    vec3 k4;
+    vec3 j1;
+    vec3 j2;
+    vec3 j3;
+    vec3 j4;
+    
+    vec3 b1;
+    vec3 b2;
+    vec3 vb1;
+    vec3 vb2;
+
+    float dt = timestep + timeDT;
+
+    for (int i = 0; i < maxsteps + 1000*rays; i ++){
+        //p += rd*dt;
+        vec4 dS = GetDistCol(p);
+
+        if(length(p - bholeA.xyz)/bholeA.w < 1.0001){
+            color = vec3(0);
+            break;
+        }
+
+        if(dS.w < surfdis){
+            color = getLight(p, dS.xyz);
+            break;
+        }
+        //rd.xy += acc*0.0002;
+        //geodesic(rd, p, rd);
+        vec3 testt;
+
+        dt = timestep * length(p - bholeA.xyz)/bholeA.w;
+        //dt = timestep * length(p - bholeA.xyz)/0.5;
+
+        dt = clamp(dt, timestep, 0.05);
+        //vec4 bholeC = vec4(0, 10, 0, 2);
+        //if(mod(i, 2) == 0){
+        geodesic(rd, p, bholeA, j1);
+        j1 *= dt;
+        k1 = rd*dt;
+
+        rd += j1;
+        p += k1;
+        
+        /*geodesic(rd + j1, p+k1, bholeA, j2);
+        j2 *= dt;
+        k2 = (rd + j1/2)*dt;
+
+        rd += (j1 + j2)/2;    
+        p += (k1 + k2)/2;*/
+    }
+
+    return color;
+}
+
+void adjustLight(in vec3 rd, in vec3 ro, out vec3 initialRD)
+{
+    vec3 pos = ro - bholeA.xyz;
+
+    //distance away from blackhole
+    float r = length(pos);
+    //schwarzchild radius
+    float rs = bholeA.w;
+
+    //common term
+    float j = 1/sqrt(1-rs/r);
+    //float j = 1;
+
+    pos = normalize(pos);
+
+    //polar unit vectors
+    vec3 rvec = pos;  //radial unit vector
+    vec3 pvec = normalize(cross(rvec, vec3(0, 1, 0)));  //phi unit vector
+    vec3 tvec = normalize(cross(pvec, rvec));  //theta unit vector
+
+    //polar velocity vector (.x = r, .y = t, .z = p)
+    //vec3 polVels;
+
+    //conversion vectors
+    //polVels.x = cos of angle with respect to radial unit vector
+    //polVels.y = cos of angle with respect to theta unit vector
+    //polVels.z = cos of angle with respect to phi unit vector
+    //cos of polar vector angles relative to the spherical unit vectors
+    vec3 polVels = vec3(dot(rd, rvec), dot(rd, tvec), dot(rd, pvec));
+
+    //polVels.x = j/(sqrt(1+(j/(polAngles.x*polAngles.x))*(polAngles.y*polAngles.y + polAngles.z*polAngles.z)));
+    //polVels.y = polVels.x*polAngles.y/polAngles.x;
+    //polVels.z = polVels.x*polAngles.z/polAngles.x;
+    //polVels = polAngles;
+    polVels.x *= j;
+
+    //polVels = length(polVels) * polAngles;
+
+    initialRD = polVels.x * rvec + polVels.y * tvec + polVels.z * pvec;
+}
+
+void geodesic(in vec3 rd, in vec3 position, in vec4 bPos, out vec3 newrd){
+    //adjust pos variable to be relative to black hole
+    vec3 pos = position - bPos.xyz;
+
+    //distance away from blackhole
+    float r = length(pos);
+    //schwarzchild radius
+    float rs = bPos.w;
+
+    pos = normalize(pos);
+
+    //polar unit vectors
+    vec3 rvec = pos;  //radial unit vector
+    vec3 pvec = normalize(cross(rvec, vec3(0, 1, 0)));  //phi unit vector
+    vec3 tvec = normalize(cross(pvec, rvec));  //theta unit vector
+
+    //conversion vectors
+    //polVels.x = radial velocity vector
+    //polVels.y = theta velocity vector
+    //polVels.z = phi velocity vector
+    vec3 polVels = vec3(dot(rd, rvec), dot(rd, tvec), dot(rd, pvec));
+
+    //theta and phi rate of change from velocity vectors
+    float tdot = polVels.y;
+    float pdot = polVels.z;
+
+    //adjustment term for using coordinate time
+
+    //repeated term
+    float diff = r - rs;
+
+    float coordTval = (rs/(2*r*(diff)))*(polVels.x);
+
+    //radial acceleration term
+    float radA = (rs/(2.0f*r*(diff)))*(polVels.x*polVels.x) + (-rs)*(tdot*tdot+pdot*pdot)/(r*r) + (rs*(-diff)/(2.0f*r*r*r))+coordTval*polVels.x;
+
+    //rad acceleration vector
+    polVels.x = radA;
+    //theta acceleration vector
+    polVels.y = coordTval*tdot;
+    //phi acceleration vector
+    polVels.z = coordTval*pdot;
+
+    //converting polar velocity vectors to cartesian velocity vectors
+    newrd = polVels.x * rvec + polVels.y * tvec + polVels.z * pvec;
+    //adjustLight(newrd1, position, newrd1);
+    //newrd = newrd1;
+}
+
+float sdTorus(vec3 p, vec2 r){
+    float x = length(p.xz) - r.x;
+    return length(vec2(x, p.y)) - r.y;
+}
+
+vec4 GetDistCol(vec3 p){
+    //vec4 s = vec4(0, 2, 6, 0.5);
+    //vec3 mpos = vec3(4*cos(time), 6, 5+4*sin(time));
+    //float mDist = mandelbulbSDF(p - mpos, 6);
+    float d = GetDist(p);
+    vec3 adjD = (p-vec3(0, 0, 0));
+    vec4 cold = vec4(0.0, 0.0, 0.0, d);
+    vec4 t = vec4(5, 10, 0, 1);
+    float tDist = length(p-t.xyz) - t.w;
+    //float td = sdTorus(p - vec3(0, 2.5, 6), vec2(2.5, 0.5));
+    float zplaneDist = 10-p.z;
+    float zplaneDist2 = 10+p.z;
+    float yplaneDist = p.y;
+    float yplaneDist2 = 20-p.y;
+    float xplane = 10- p.x;
+    float xplane2 = p.x+10;
+    float sphDist = radG-length(adjD);
+    vec2 galcoord;
+    float thetC = atan(-adjD.z,adjD.x);
+    float u = (thetC + PI)/(2*PI);
+    float phiC = acos(-adjD.y/radG);
+    float v = phiC/PI;
+    if(d == sphDist){
+        galcoord = vec2(u, v);
+        //cold.xyz = vec3(0.1686, 1.0, 0.0);
+        cold.xyz = texture(galaxy, galcoord).xyz;
+    }
+    /*if(d == tDist)
+        cold.xyz = vec3(1.0, 0.2824, 0.0);
+    if(d == xplane)
+        cold.xyz = vec3(.5, 0.7, 0.2);
+    if(d == yplaneDist)
+        cold.xyz = vec3(1.0, 1.0, 1.0);
+    if(d == zplaneDist)
+        cold.xyz = vec3(0.8627, 0.0235, 0.9412);
+    if(d == xplane2)
+        cold.xyz = vec3(0.9137, 0.6392, 0.051);
+    if(d == yplaneDist2)
+        cold.xyz = vec3(1.0, 0.0, 0.0);
+    if(d == zplaneDist2)
+        cold.xyz = vec3(0.6667, 0.6235, 0.0);*/
+    return cold;
+}
+
+float GetDist(vec3 p){
+    //vec4 s = vec4(0, 2, 6, 0.5);
+    //vec3 mpos = vec3(4*cos(time), 6, 5+4*sin(time));
+    //float mDist = mandelbulbSDF(p - mpos, 6);
+
+    //grid scale
+    float gscale = 102.4;
+
+    //light ray search radius
+    const int lrad = 2;
+    float ssize = 0.005;
+
+    //float yplaneDist = p.y;
+
+    //float d = yplaneDist;
+    float d = 100;
+    vec3 sxz;
+
+    vec2 atlastest;
+    float sDist;
+
+    for(int i = 0; i < lrad; i ++){
+        for(int j = 0; j < lrad; j ++){
+            atlastest = ivec2(p.xz*gscale) + ivec2(i, j) + 1536 - 1;
+            atlastest /= texRes;
+            sxz = texture(testSample, atlastest).xyz;
+            sDist = length(p - sxz) - ssize;
+            d = min(d, sDist);
+        }
+    }
+
+
+    vec4 t = vec4(5, 10, 0, 1);
+    vec3 adjD = (p-vec3(0, 0, 0));
+    //float tDist = length(p-t.xyz) - t.w;
+    //vec4 s = vec4(5, 10, 5, 1);
+    //float tDist = length(p-t.xyz) - t.w;
+    //float td = sdTorus(p - vec3(0, 2.5, 6), vec2(2.5, 0.5));
+    float zplaneDist = 10-p.z;
+    float zplaneDist2 = 10+p.z;
+    float yplaneDist2 = 20-p.y;
+    float xplane = 10- p.x;
+    float xplane2 = p.x+10;
+    float sphDist = radG-length(adjD);
+
+    //float d = min(sDist, zplaneDist);
+    //d = min(d, yplaneDist);
+    //d = min(d, zplaneDist);
+    d = min(d, sphDist);
+    //d = min(d, sDist);
+    //d = min(d, sDist2);
+    //d = min(d, sDist3);
+    //d = min(d, sDist4);
+    //d = min(d, td);
+    //d = min(d, xplane);
+    //d = min(d, xplane2);
+    //d = min(d, yplaneDist2);
+    //d = min(d, zplaneDist2);
+    //d = min(d, tDist);
+    return d;
+}
+
+vec3 compare(vec3 one, vec3 two, vec3 three){
+    vec3 final = one;
+    vec3 onetwo = (one-two)/two;
+    vec3 onethree = (one-three)/three;
+    vec3 twothree = (two-three)/three;
+    if(abs(onetwo.x) < 0.05 && abs(onetwo.y) < 0.05 && abs(onetwo.z) < 0.05)
+    {
+        final = one;
+    }
+    if(abs(onethree.x) < 0.05 && abs(onethree.y) < 0.05 && abs(onethree.z) < 0.05)
+    {
+        final = two;
+    }
+    if(abs(twothree.x) < 0.05 && abs(twothree.y) < 0.05 && abs(twothree.z) < 0.05)
+    {
+        final = three;
+    }
+    return final;
+}
+
+vec3 getLight(vec3 p, vec3 col){
+    vec3 light = vec3(0, 15, 10);
+    vec3 lColor = vec3(0.8078, 0.2118, 0.2118);
+
+    if(col != vec3(0.0f)){
+        lColor = col;
+    }
+
+    vec3 l = normalize(light - p);
+    vec3 n = GetNormal(p);
+
+    float dif = clamp(dot(n, l), 0.2, 1.0);
+    //float dif = dot(n, l)+0.5;
+
+    return dif * lColor;
+}
+
+vec3 GetNormal(vec3 p){
+    float d = GetDist(p);
+    vec2 e = vec2(.01, 0);
+
+    vec3 n = d - vec3(
+        GetDist(p - e.xyy),
+        GetDist(p - e.yxy),
+        GetDist(p - e.yyx)
+    );
+
+    return normalize(n);
+}
+
+//spherical to cartesian coordinates
+void transform(in vec3 sphComp, out vec3 cartPos){
+    float radius = sphComp.x;
+    float theta = sphComp.y;
+    float phi = sphComp.z;
+
+    float y = radius * cos(theta);
+    float x = radius * sin(theta) * cos(phi);
+    float z = radius * sin(theta) * sin(theta);
+}
+
+/*float mandelbulbSDF(vec3 p, float power) {
+    vec3 z = p;
+    float dr = 1.0;
+    float r = 0.0;
+    for(int i = 0; i < 5; i++) {
+        // convert to polar coordinates
+        float theta = acos(clamp(z.z/r, -1.0, 1.0));
+        float phi = atan(z.y, z.x);
+        dr = pow(sqrt(r), power-1.0)*power*dr+1.0;
+
+        // scale and rotate the point
+        float zr = pow(r, power);
+        theta = theta*power;
+        phi = phi*power;
+
+        // convert back to cartesian coordinates
+        z = zr*vec3(sin(theta)*cos(phi), sin(phi)*sin(theta), cos(theta));
+        z += p;
+
+        r = length(z);
+        if(dot(z, z) > 4.0) break;
+    }
+    return 0.8*log(r)*sqrt(r)/dr;
+}*/
